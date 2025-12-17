@@ -286,6 +286,25 @@ class FalkorDriver(GraphDriver):
         else:
             return obj
 
+    def escape_group_id(self, group_id: str) -> str:
+        """
+        Escape RediSearch special characters in group_id values.
+
+        RediSearch treats these characters as operators/separators in field queries,
+        so they must be escaped with backslash to be treated literally.
+
+        Special chars: , . < > { } [ ] " ' : ; ! @ # $ % ^ & * ( ) - + = ~ ? | \
+
+        Added by watercooler-cloud to fix: underscore/hyphen in thread IDs cause
+        "RediSearch: Syntax error" when used in (@group_id:value) queries.
+        """
+        # RediSearch special characters that need escaping
+        special_chars = ',.<>{}[]"\':;!@#$%^&*()-+=~?|\\'
+        escaped = group_id
+        for char in special_chars:
+            escaped = escaped.replace(char, f'\\{char}')
+        return escaped
+
     def sanitize(self, query: str) -> str:
         """
         Replace FalkorDB special characters with whitespace.
@@ -333,19 +352,15 @@ class FalkorDriver(GraphDriver):
     ) -> str:
         """
         Build a fulltext query string for FalkorDB using RedisSearch syntax.
-        FalkorDB uses RedisSearch-like syntax where:
-        - Field queries use @ prefix: @field:value
-        - Multiple values for same field: (@field:value1|value2)
-        - Text search doesn't need @ prefix for content fields
-        - AND is implicit with space: (@group_id:value) (text)
-        - OR uses pipe within parentheses: (@group_id:value1|value2)
+        
+        IMPORTANT: FalkorDB's db.idx.fulltext.queryNodes/queryRelationships APIs
+        do NOT support field filtering syntax like (@field:value). They only accept
+        plain text search queries. Group filtering must be done via Cypher WHERE clauses.
+        
+        This method sanitizes the query text and returns it for fulltext search.
+        The group_ids parameter is ignored for FalkorDB - group filtering happens
+        in the calling code via WHERE clauses.
         """
-        if group_ids is None or len(group_ids) == 0:
-            group_filter = ''
-        else:
-            group_values = '|'.join(group_ids)
-            group_filter = f'(@group_id:{group_values})'
-
         sanitized_query = self.sanitize(query)
 
         # Remove stopwords from the sanitized query
@@ -354,9 +369,7 @@ class FalkorDriver(GraphDriver):
         sanitized_query = ' | '.join(filtered_words)
 
         # If the query is too long return no query
-        if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:
+        if len(sanitized_query.split(' ')) >= max_query_length:
             return ''
 
-        full_query = group_filter + ' (' + sanitized_query + ')'
-
-        return full_query
+        return sanitized_query
