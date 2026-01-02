@@ -5,9 +5,12 @@ This module provides database-agnostic query generation for Neo4j and FalkorDB,
 supporting index creation, fulltext search, and bulk operations.
 """
 
+from typing import cast
+
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.embedder.client import EMBEDDING_DIM
 
 # Mapping from Neo4j fulltext index names to FalkorDB node labels
 NEO4J_TO_FALKORDB_MAPPING = {
@@ -27,7 +30,12 @@ INDEX_TO_LABEL_KUZU_MAPPING = {
 
 def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
     if provider == GraphProvider.FALKORDB:
+        vector_index_query: LiteralString = cast(
+            LiteralString,
+            f"CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) OPTIONS {{dimension: {EMBEDDING_DIM}, similarityFunction: 'cosine'}}",
+        )
         return [
+            vector_index_query,
             # Entity node
             'CREATE INDEX FOR (n:Entity) ON (n.uuid, n.group_id, n.name, n.created_at)',
             # Episodic node

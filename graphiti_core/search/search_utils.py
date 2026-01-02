@@ -730,6 +730,37 @@ async def node_similarity_search(
             )
         else:
             return []
+    elif driver.provider == GraphProvider.FALKORDB:
+        conditions = filter_queries.copy()
+        conditions.append('score > $min_score')
+        where_clause = ''
+        if conditions:
+            where_clause = ' WHERE ' + ' AND '.join(conditions)
+
+        query = (
+            """
+            CALL db.idx.vector.queryNodes('Entity', 'name_embedding', $limit, vecf32($search_vector))
+            YIELD node AS n, score
+            """
+            + where_clause
+            + """
+            RETURN
+            """
+            + get_entity_node_return_query(driver.provider)
+            + """
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+        )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            min_score=min_score,
+            routing_='r',
+            **filter_params,
+        )
     else:
         query = (
             """
