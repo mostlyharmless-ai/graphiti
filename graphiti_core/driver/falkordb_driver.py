@@ -352,20 +352,38 @@ class FalkorDriver(GraphDriver):
     ) -> str:
         """
         Build a fulltext query string for FalkorDB using RedisSearch syntax.
-        
+
         IMPORTANT: FalkorDB's db.idx.fulltext.queryNodes/queryRelationships APIs
         do NOT support field filtering syntax like (@field:value). They only accept
         plain text search queries. Group filtering must be done via Cypher WHERE clauses.
-        
+
         This method sanitizes the query text and returns it for fulltext search.
         The group_ids parameter is ignored for FalkorDB - group filtering happens
         in the calling code via WHERE clauses.
+
+        Query complexity is limited to MAX_FULLTEXT_TERMS OR terms to prevent
+        timeout errors on large graphs. Complex queries with many OR terms cause
+        exponential search time in the fulltext index.
         """
+        # Limit the number of OR terms to prevent query timeouts.
+        # FalkorDB's fulltext index can timeout on complex queries with many OR terms
+        # because it must scan and union results for each term. Limiting to 10 terms
+        # keeps query execution time reasonable while still providing meaningful search.
+        MAX_FULLTEXT_TERMS = 10
+
         sanitized_query = self.sanitize(query)
 
         # Remove stopwords from the sanitized query
         query_words = sanitized_query.split()
         filtered_words = [word for word in query_words if word.lower() not in STOPWORDS]
+
+        # Truncate to MAX_FULLTEXT_TERMS to prevent query timeout on large graphs.
+        # Queries with 17-20+ OR terms have been observed to timeout during episode
+        # indexing. Taking the first N terms preserves the most important keywords
+        # (typically entity names appear early in the extracted content).
+        if len(filtered_words) > MAX_FULLTEXT_TERMS:
+            filtered_words = filtered_words[:MAX_FULLTEXT_TERMS]
+
         sanitized_query = ' | '.join(filtered_words)
 
         # If the query is too long return no query
