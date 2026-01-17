@@ -200,15 +200,18 @@ def _resolve_with_similarity(
     indexes: DedupCandidateIndexes,
     state: DedupResolutionState,
 ) -> None:
-    """Attempt deterministic resolution using exact name hits and fuzzy MinHash comparisons."""
+    """Attempt deterministic resolution using exact name hits and fuzzy MinHash comparisons.
+
+    IMPORTANT: Exact match check happens FIRST, before entropy filtering. This ensures
+    short/low-entropy names like "caleb" (5 chars, 1 token) are still deduplicated when
+    an exact match exists, rather than being deferred to the LLM which may create duplicates.
+    """
     for idx, node in enumerate(extracted_nodes):
         normalized_exact = _normalize_string_exact(node.name)
         normalized_fuzzy = _normalize_name_for_fuzzy(node.name)
 
-        if not _has_high_entropy(normalized_fuzzy):
-            state.unresolved_indices.append(idx)
-            continue
-
+        # FIXED: Check exact match FIRST (regardless of entropy)
+        # This prevents duplicates for short names like "bob", "alice", "caleb"
         existing_matches = indexes.normalized_existing.get(normalized_exact, [])
         if len(existing_matches) == 1:
             match = existing_matches[0]
@@ -217,10 +220,19 @@ def _resolve_with_similarity(
             if match.uuid != node.uuid:
                 state.duplicate_pairs.append((node, match))
             continue
+
+        # Multiple exact matches - defer to LLM for disambiguation
         if len(existing_matches) > 1:
             state.unresolved_indices.append(idx)
             continue
 
+        # THEN check entropy for fuzzy matching only (no exact match found)
+        # Low-entropy names without exact matches go to LLM as before
+        if not _has_high_entropy(normalized_fuzzy):
+            state.unresolved_indices.append(idx)
+            continue
+
+        # Fuzzy MinHash matching (only for high-entropy names with no exact match)
         shingles = _cached_shingles(normalized_fuzzy)
         signature = _minhash_signature(shingles)
         candidate_ids: set[str] = set()
