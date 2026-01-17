@@ -185,6 +185,18 @@ async def edge_fulltext_search(
     if fuzzy_query == '':
         return []
 
+    # Short-circuit if edge_uuids filter is an empty list.
+    #
+    # When valid_edges is empty during episode addition (e.g., no existing edges
+    # match the extracted entities), the search is called with edge_uuids=[].
+    # Without this check, the expensive fulltext query runs and then filters to
+    # nothing via "WHERE e.uuid IN []", causing query timeouts on large graphs.
+    #
+    # An empty edge_uuids list means "filter to these specific edges" with no
+    # edges specified, so the result is always empty - we can return immediately.
+    if search_filter.edge_uuids is not None and len(search_filter.edge_uuids) == 0:
+        return []
+
     match_query = """
     YIELD relationship AS rel, score
     MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)

@@ -5,6 +5,7 @@ services:
       - "6379:6379" # Redis/FalkorDB port
       - "3000:3000" # FalkorDB web UI
     environment:
+      - FALKORDB_ARGS=TIMEOUT 120000
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
       - BROWSER=${BROWSER:-1}  # Enable FalkorDB Browser UI (set to 0 to disable)
     volumes:

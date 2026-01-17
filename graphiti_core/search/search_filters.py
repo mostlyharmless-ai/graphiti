@@ -120,7 +120,11 @@ def edge_search_filter_query_constructor(
         filter_queries.append('e.name in $edge_types')
         filter_params['edge_types'] = edge_types
 
-    if filters.edge_uuids is not None:
+    # Only add edge_uuids filter if the list is non-empty.
+    # An empty list [] is truthy for "is not None" but would create a WHERE clause
+    # like "e.uuid IN []" that matches nothing, wasting query execution time.
+    # Callers pass edge_uuids=[] when valid_edges is empty during episode addition.
+    if filters.edge_uuids is not None and filters.edge_uuids:
         filter_queries.append('e.uuid in $edge_uuids')
         filter_params['edge_uuids'] = filters.edge_uuids
 
