@@ -167,6 +167,83 @@ async def get_communities_by_nodes(
     return communities
 
 
+async def _edge_direct_fetch_with_text_filter(
+    driver: GraphDriver,
+    query: str,
+    edge_uuids: list[str],
+    group_ids: list[str] | None,
+    limit: int,
+) -> list[EntityEdge]:
+    """Fetch specific edges by UUID and filter by query text in Python.
+
+    This is an optimization for edge_fulltext_search when a specific set of
+    edge_uuids is provided. Instead of running an expensive fulltext index
+    scan that then filters to the specific UUIDs, we:
+
+    1. Fetch the edges directly by UUID (O(1) lookup per edge)
+    2. Apply simple text matching in Python
+
+    This avoids the fulltext index scan which can timeout on large graphs.
+    The text matching is case-insensitive and checks if any query term
+    appears in the edge's name or fact fields.
+
+    Args:
+        driver: Graph database driver
+        query: Search query string (space-separated terms)
+        edge_uuids: List of edge UUIDs to fetch and filter
+        group_ids: Optional group IDs to filter by
+        limit: Maximum number of results to return
+
+    Returns:
+        List of EntityEdge objects matching the query terms
+    """
+    from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
+
+    # Build query to fetch edges directly by UUID
+    match_query = """
+        MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+        WHERE e.uuid IN $edge_uuids
+    """
+    if driver.provider == GraphProvider.KUZU:
+        match_query = """
+            MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
+            WHERE e.uuid IN $edge_uuids
+        """
+
+    # Add group_id filter if specified
+    params: dict[str, Any] = {'edge_uuids': edge_uuids}
+    if group_ids is not None:
+        match_query += ' AND e.group_id IN $group_ids'
+        params['group_ids'] = group_ids
+
+    cypher = (
+        match_query
+        + """
+        WITH e, n, m
+        RETURN
+        """
+        + get_entity_edge_return_query(driver.provider)
+    )
+
+    records, _, _ = await driver.execute_query(cypher, routing_='r', **params)
+
+    # Convert records to EntityEdge objects
+    edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+
+    # Apply text filter in Python - check if any query term appears in name or fact
+    # This is simpler than fulltext search but sufficient for deduplication purposes
+    query_terms = [term.lower() for term in query.split() if term]
+    if not query_terms:
+        return edges[:limit]
+
+    def matches_query(edge: EntityEdge) -> bool:
+        searchable = f'{edge.name or ""} {edge.fact or ""}'.lower()
+        return any(term in searchable for term in query_terms)
+
+    matching_edges = [edge for edge in edges if matches_query(edge)]
+    return matching_edges[:limit]
+
+
 async def edge_fulltext_search(
     driver: GraphDriver,
     query: str,
@@ -196,6 +273,22 @@ async def edge_fulltext_search(
     # edges specified, so the result is always empty - we can return immediately.
     if search_filter.edge_uuids is not None and len(search_filter.edge_uuids) == 0:
         return []
+
+    # Optimization: When edge_uuids is provided (small set of specific edges),
+    # skip the expensive fulltext search and fetch edges directly by UUID.
+    #
+    # The fulltext query scans the entire RELATES_TO index before filtering to
+    # the specific UUIDs, which is inefficient and causes timeouts on large graphs.
+    # Instead, we fetch the edges directly and do simple text matching in Python.
+    #
+    # This is much faster because:
+    # 1. Direct UUID lookup is O(1) per edge vs O(N) fulltext scan
+    # 2. We only process the exact edges we care about
+    # 3. Simple substring matching is sufficient for deduplication purposes
+    if search_filter.edge_uuids is not None and len(search_filter.edge_uuids) > 0:
+        return await _edge_direct_fetch_with_text_filter(
+            driver, query, search_filter.edge_uuids, group_ids, limit
+        )
 
     match_query = """
     YIELD relationship AS rel, score
