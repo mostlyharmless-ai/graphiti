@@ -367,9 +367,9 @@ class FalkorDriver(GraphDriver):
         """
         # Limit the number of OR terms to prevent query timeouts.
         # FalkorDB's fulltext index can timeout on complex queries with many OR terms
-        # because it must scan and union results for each term. Limiting to 10 terms
-        # keeps query execution time reasonable while still providing meaningful search.
-        MAX_FULLTEXT_TERMS = 10
+        # because it must scan and union results for each term. Testing showed that
+        # even 8-10 terms can timeout on large graphs, so we limit to 6 terms.
+        MAX_FULLTEXT_TERMS = 6
 
         sanitized_query = self.sanitize(query)
 
@@ -377,8 +377,20 @@ class FalkorDriver(GraphDriver):
         query_words = sanitized_query.split()
         filtered_words = [word for word in query_words if word.lower() not in STOPWORDS]
 
+        # Deduplicate terms while preserving order (first occurrence wins).
+        # Duplicate terms like "sync | sync" waste query budget and can occur when
+        # the same word appears multiple times in the source content.
+        seen: set[str] = set()
+        unique_words: list[str] = []
+        for word in filtered_words:
+            word_lower = word.lower()
+            if word_lower not in seen:
+                seen.add(word_lower)
+                unique_words.append(word)
+        filtered_words = unique_words
+
         # Truncate to MAX_FULLTEXT_TERMS to prevent query timeout on large graphs.
-        # Queries with 17-20+ OR terms have been observed to timeout during episode
+        # Queries with 8-10+ OR terms have been observed to timeout during episode
         # indexing. Taking the first N terms preserves the most important keywords
         # (typically entity names appear early in the extracted content).
         if len(filtered_words) > MAX_FULLTEXT_TERMS:

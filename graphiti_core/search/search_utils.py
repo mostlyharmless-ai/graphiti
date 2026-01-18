@@ -290,15 +290,30 @@ async def edge_fulltext_search(
             driver, query, search_filter.edge_uuids, group_ids, limit
         )
 
-    match_query = """
+    # FalkorDB's fulltext API doesn't support inline limit (unlike Neo4j), so we add it
+    # after YIELD to prevent timeout from joining thousands of results.
+    # Without this, a query returning 1760 fulltext matches causes 1760 JOINs at ~65ms each = 114s timeout.
+    if driver.provider == GraphProvider.FALKORDB:
+        # Oversample to account for group_id filtering that happens after the JOIN
+        FULLTEXT_OVERSAMPLE_FACTOR = 5
+        early_limit = limit * FULLTEXT_OVERSAMPLE_FACTOR
+        match_query = f"""
     YIELD relationship AS rel, score
-    MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    WITH rel, score
+    ORDER BY score DESC
+    LIMIT {early_limit}
+    MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]->(m:Entity)
     """
-    if driver.provider == GraphProvider.KUZU:
+    elif driver.provider == GraphProvider.KUZU:
         match_query = """
         YIELD node, score
         MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: node.uuid})-[:RELATES_TO]->(m:Entity)
         """
+    else:
+        match_query = """
+    YIELD relationship AS rel, score
+    MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    """
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
