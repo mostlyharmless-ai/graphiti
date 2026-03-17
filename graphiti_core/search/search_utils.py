@@ -518,6 +518,43 @@ async def edge_similarity_search(
             )
         else:
             return []
+    elif driver.provider == GraphProvider.FALKORDB:
+        # Use HNSW vector index for O(log n) search instead of O(n) full scan.
+        # queryRelationships yields (relationship, score); we join to get (n, m)
+        # for source/target UUIDs. The index already limits to $limit results so
+        # no oversample trick is needed here (unlike the fulltext path).
+        conditions = filter_queries.copy()
+        conditions.append('score > $min_score')
+        where_clause = ''
+        if conditions:
+            where_clause = ' WHERE ' + ' AND '.join(conditions)
+
+        query = (
+            """
+            CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', $limit, vecf32($search_vector))
+            YIELD relationship AS rel, score
+            MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+            """
+            + where_clause
+            + """
+            WITH e, score, n, m
+            RETURN
+            """
+            + get_entity_edge_return_query(driver.provider)
+            + """
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+        )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            min_score=min_score,
+            routing_='r',
+            **filter_params,
+        )
     else:
         query = (
             match_query

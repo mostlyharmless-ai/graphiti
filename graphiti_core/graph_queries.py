@@ -34,8 +34,13 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
             LiteralString,
             f"CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) OPTIONS {{dimension: {EMBEDDING_DIM}, similarityFunction: 'cosine'}}",
         )
+        edge_vector_index_query: LiteralString = cast(
+            LiteralString,
+            f"CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]->() ON (e.fact_embedding) OPTIONS {{dimension: {EMBEDDING_DIM}, similarityFunction: 'cosine'}}",
+        )
         return [
             vector_index_query,
+            edge_vector_index_query,
             # Entity node
             'CREATE INDEX FOR (n:Entity) ON (n.uuid, n.group_id, n.name, n.created_at)',
             # Episodic node
