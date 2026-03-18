@@ -290,14 +290,76 @@ async def edge_fulltext_search(
             driver, query, search_filter.edge_uuids, group_ids, limit
         )
 
-    # FalkorDB's fulltext API doesn't support inline limit (unlike Neo4j), so we add it
-    # after YIELD to prevent timeout from joining thousands of results.
-    # Without this, a query returning 1760 fulltext matches causes 1760 JOINs at ~65ms each = 114s timeout.
+    # FalkorDB's fulltext API doesn't support inline limit (unlike Neo4j), so we
+    # add an early LIMIT after YIELD. The MATCH-free path (node_labels is None)
+    # eliminates JOIN cost entirely; the MATCH fallback still needs this cap.
     if driver.provider == GraphProvider.FALKORDB:
-        # Oversample to account for group_id filtering that happens after the JOIN
+        # Oversample to account for temporal filtering (valid_at/invalid_at)
+        # that happens after the fulltext YIELD.
         FULLTEXT_OVERSAMPLE_FACTOR = 5
         early_limit = limit * FULLTEXT_OVERSAMPLE_FACTOR
-        match_query = f"""
+
+        if search_filter.node_labels is None:
+            # MATCH-free path: source_node_uuid/target_node_uuid are stored
+            # as edge properties by the bulk save (SET r = edge), so we can
+            # skip the expensive MATCH JOIN entirely.
+            # Guard: node_labels filters reference n/m which are not bound
+            # without MATCH. If node_labels is set, fall through to MATCH path.
+            match_query = f"""
+    YIELD relationship AS rel, score
+    WITH rel AS e, score
+    ORDER BY score DESC
+    LIMIT {early_limit}
+    """
+            # Build filter_query from e.* predicates (safe — no n/m refs)
+            filter_queries, filter_params = edge_search_filter_query_constructor(
+                search_filter, driver.provider
+            )
+            if group_ids is not None:
+                filter_queries.append('e.group_id IN $group_ids')
+                filter_params['group_ids'] = group_ids
+            filter_query = ''
+            if filter_queries:
+                filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+
+            query = (
+                get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
+                + match_query
+                + filter_query
+                + """
+            WITH e, score
+            RETURN
+                e.uuid AS uuid,
+                e.source_node_uuid AS source_node_uuid,
+                e.target_node_uuid AS target_node_uuid,
+                e.group_id AS group_id,
+                e.created_at AS created_at,
+                e.name AS name,
+                e.fact AS fact,
+                e.episodes AS episodes,
+                e.expired_at AS expired_at,
+                e.valid_at AS valid_at,
+                e.invalid_at AS invalid_at,
+                properties(e) AS attributes
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+            )
+
+            records, _, _ = await driver.execute_query(
+                query,
+                query=fuzzy_query,
+                limit=limit,
+                routing_='r',
+                **filter_params,
+            )
+
+            edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+            return edges
+
+        else:
+            # Fallback: node_labels requires n/m bindings from MATCH
+            match_query = f"""
     YIELD relationship AS rel, score
     WITH rel, score
     ORDER BY score DESC
