@@ -435,6 +435,28 @@ class FalkorDriver(GraphDriver):
         # Remove stopwords and empty tokens from the sanitized query
         query_words = sanitized_query.split()
         filtered_words = [word for word in query_words if word and word.lower() not in STOPWORDS]
+
+        # Deduplicate terms while preserving order (first occurrence wins).
+        # Duplicate terms like "sync | sync" waste query budget and can occur when
+        # the same keyword appears multiple times in the source text.
+        seen: set[str] = set()
+        unique_words = []
+        for word in filtered_words:
+            word_lower = word.lower()
+            if word_lower not in seen:
+                seen.add(word_lower)
+                unique_words.append(word)
+        filtered_words = unique_words
+
+        # Truncate to MAX_FULLTEXT_TERMS to prevent query timeout on large graphs.
+        # FalkorDB's fulltext index can timeout on complex queries with many OR
+        # terms because it must scan and union results for each term. Queries with
+        # 8-10+ OR terms have been observed to timeout during episode indexing.
+        # Taking the first N terms preserves the most important keywords.
+        MAX_FULLTEXT_TERMS = 6
+        if len(filtered_words) > MAX_FULLTEXT_TERMS:
+            filtered_words = filtered_words[:MAX_FULLTEXT_TERMS]
+
         sanitized_query = ' | '.join(filtered_words)
 
         # If the query is too long return no query

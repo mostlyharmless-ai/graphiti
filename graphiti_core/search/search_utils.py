@@ -182,6 +182,83 @@ async def get_communities_by_nodes(
     return communities
 
 
+async def _edge_direct_fetch_with_text_filter(
+    driver: GraphDriver,
+    query: str,
+    edge_uuids: list[str],
+    group_ids: list[str] | None,
+    limit: int,
+) -> list[EntityEdge]:
+    """Fetch specific edges by UUID and filter by query text in Python.
+
+    This is an optimization for edge_fulltext_search when a specific set of
+    edge_uuids is provided. Instead of running an expensive fulltext index
+    scan that then filters to the specific UUIDs, we:
+
+    1. Fetch the edges directly by UUID (O(1) lookup per edge)
+    2. Apply simple text matching in Python
+
+    This avoids the fulltext index scan which can timeout on large graphs.
+    The text matching is case-insensitive and checks if any query term
+    appears in the edge's name or fact fields.
+
+    Args:
+        driver: Graph database driver
+        query: Search query string (space-separated terms)
+        edge_uuids: List of edge UUIDs to fetch and filter
+        group_ids: Optional group IDs to filter by
+        limit: Maximum number of results to return
+
+    Returns:
+        List of EntityEdge objects matching the query terms
+    """
+    from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
+
+    # Build query to fetch edges directly by UUID
+    match_query = """
+        MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+        WHERE e.uuid IN $edge_uuids
+    """
+    if driver.provider == GraphProvider.KUZU:
+        match_query = """
+            MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
+            WHERE e.uuid IN $edge_uuids
+        """
+
+    # Add group_id filter if specified
+    params: dict[str, Any] = {'edge_uuids': edge_uuids}
+    if group_ids is not None:
+        match_query += ' AND e.group_id IN $group_ids'
+        params['group_ids'] = group_ids
+
+    cypher = (
+        match_query
+        + """
+        WITH e, n, m
+        RETURN
+        """
+        + get_entity_edge_return_query(driver.provider)
+    )
+
+    records, _, _ = await driver.execute_query(cypher, routing_='r', **params)
+
+    # Convert records to EntityEdge objects
+    edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+
+    # Apply text filter in Python - check if any query term appears in name or fact
+    # This is simpler than fulltext search but sufficient for deduplication purposes
+    query_terms = [term.lower() for term in query.split() if term]
+    if not query_terms:
+        return edges[:limit]
+
+    def matches_query(edge: EntityEdge) -> bool:
+        searchable = f'{edge.name or ""} {edge.fact or ""}'.lower()
+        return any(term in searchable for term in query_terms)
+
+    matching_edges = [edge for edge in edges if matches_query(edge)]
+    return matching_edges[:limit]
+
+
 async def edge_fulltext_search(
     driver: GraphDriver,
     query: str,
@@ -200,15 +277,120 @@ async def edge_fulltext_search(
     if fuzzy_query == '':
         return []
 
-    match_query = """
+    # Short-circuit if edge_uuids filter is an empty list.
+    #
+    # When valid_edges is empty during episode addition (e.g., no existing edges
+    # match the extracted entities), the search is called with edge_uuids=[].
+    # Without this check, the expensive fulltext query runs and then filters to
+    # nothing via "WHERE e.uuid IN []", causing query timeouts on large graphs.
+    #
+    # An empty edge_uuids list means "filter to these specific edges" with no
+    # edges specified, so the result is always empty - we can return immediately.
+    if search_filter.edge_uuids is not None and len(search_filter.edge_uuids) == 0:
+        return []
+
+    # Optimization: When edge_uuids is provided (small set of specific edges),
+    # skip the expensive fulltext search and fetch edges directly by UUID.
+    #
+    # The fulltext query scans the entire RELATES_TO index before filtering to
+    # the specific UUIDs, which is inefficient and causes timeouts on large graphs.
+    # Instead, we fetch the edges directly and do simple text matching in Python.
+    #
+    # This is much faster because:
+    # 1. Direct UUID lookup is O(1) per edge vs O(N) fulltext scan
+    # 2. We only process the exact edges we care about
+    # 3. Simple substring matching is sufficient for deduplication purposes
+    if search_filter.edge_uuids is not None and len(search_filter.edge_uuids) > 0:
+        return await _edge_direct_fetch_with_text_filter(
+            driver, query, search_filter.edge_uuids, group_ids, limit
+        )
+
+    # FalkorDB's fulltext API doesn't support inline limit (unlike Neo4j), so we
+    # add an early LIMIT after YIELD. The MATCH-free path (node_labels is None)
+    # eliminates JOIN cost entirely; the MATCH fallback still needs this cap.
+    if driver.provider == GraphProvider.FALKORDB:
+        # Oversample to account for temporal filtering (valid_at/invalid_at)
+        # that happens after the fulltext YIELD.
+        FULLTEXT_OVERSAMPLE_FACTOR = 5
+        early_limit = limit * FULLTEXT_OVERSAMPLE_FACTOR
+
+        if search_filter.node_labels is None:
+            # MATCH-free path: source_node_uuid/target_node_uuid are stored
+            # as edge properties by the bulk save (SET r = edge), so we can
+            # skip the expensive MATCH JOIN entirely.
+            # Guard: node_labels filters reference n/m which are not bound
+            # without MATCH. If node_labels is set, fall through to MATCH path.
+            match_query = f"""
     YIELD relationship AS rel, score
-    MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    WITH rel AS e, score
+    ORDER BY score DESC
+    LIMIT {early_limit}
     """
-    if driver.provider == GraphProvider.KUZU:
+            # Build filter_query from e.* predicates (safe — no n/m refs)
+            filter_queries, filter_params = edge_search_filter_query_constructor(
+                search_filter, driver.provider
+            )
+            if group_ids is not None:
+                filter_queries.append('e.group_id IN $group_ids')
+                filter_params['group_ids'] = group_ids
+            filter_query = ''
+            if filter_queries:
+                filter_query = ' WHERE ' + (' AND '.join(filter_queries))
+
+            query = (
+                get_relationships_query('edge_name_and_fact', limit=limit, provider=driver.provider)
+                + match_query
+                + filter_query
+                + """
+            WITH e, score
+            RETURN
+                e.uuid AS uuid,
+                e.source_node_uuid AS source_node_uuid,
+                e.target_node_uuid AS target_node_uuid,
+                e.group_id AS group_id,
+                e.created_at AS created_at,
+                e.name AS name,
+                e.fact AS fact,
+                e.episodes AS episodes,
+                e.expired_at AS expired_at,
+                e.valid_at AS valid_at,
+                e.invalid_at AS invalid_at,
+                properties(e) AS attributes
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+            )
+
+            records, _, _ = await driver.execute_query(
+                query,
+                query=fuzzy_query,
+                limit=limit,
+                routing_='r',
+                **filter_params,
+            )
+
+            edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+            return edges
+
+        else:
+            # Fallback: node_labels requires n/m bindings from MATCH
+            match_query = f"""
+    YIELD relationship AS rel, score
+    WITH rel, score
+    ORDER BY score DESC
+    LIMIT {early_limit}
+    MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]->(m:Entity)
+    """
+    elif driver.provider == GraphProvider.KUZU:
         match_query = """
         YIELD node, score
         MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: node.uuid})-[:RELATES_TO]->(m:Entity)
         """
+    else:
+        match_query = """
+    YIELD relationship AS rel, score
+    MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    """
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
@@ -413,6 +595,43 @@ async def edge_similarity_search(
             )
         else:
             return []
+    elif driver.provider == GraphProvider.FALKORDB:
+        # Use HNSW vector index for O(log n) search instead of O(n) full scan.
+        # queryRelationships yields (relationship, score); we join to get (n, m)
+        # for source/target UUIDs. The index already limits to $limit results so
+        # no oversample trick is needed here (unlike the fulltext path).
+        conditions = filter_queries.copy()
+        conditions.append('score > $min_score')
+        where_clause = ''
+        if conditions:
+            where_clause = ' WHERE ' + ' AND '.join(conditions)
+
+        query = (
+            """
+            CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', $limit, vecf32($search_vector))
+            YIELD relationship AS rel, score
+            MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+            """
+            + where_clause
+            + """
+            WITH e, score, n, m
+            RETURN
+            """
+            + get_entity_edge_return_query(driver.provider)
+            + """
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+        )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            min_score=min_score,
+            routing_='r',
+            **filter_params,
+        )
     else:
         query = (
             match_query
@@ -753,6 +972,37 @@ async def node_similarity_search(
             )
         else:
             return []
+    elif driver.provider == GraphProvider.FALKORDB:
+        conditions = filter_queries.copy()
+        conditions.append('score > $min_score')
+        where_clause = ''
+        if conditions:
+            where_clause = ' WHERE ' + ' AND '.join(conditions)
+
+        query = (
+            """
+            CALL db.idx.vector.queryNodes('Entity', 'name_embedding', $limit, vecf32($search_vector))
+            YIELD node AS n, score
+            """
+            + where_clause
+            + """
+            RETURN
+            """
+            + get_entity_node_return_query(driver.provider)
+            + """
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+        )
+
+        records, _, _ = await driver.execute_query(
+            query,
+            search_vector=search_vector,
+            limit=limit,
+            min_score=min_score,
+            routing_='r',
+            **filter_params,
+        )
     else:
         query = (
             """
