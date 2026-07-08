@@ -315,6 +315,14 @@ class Node(BaseModel, ABC):
     async def get_by_uuids(cls, driver: GraphDriver, uuids: list[str]): ...
 
 
+# Whitelisted scalar episode_metadata keys persisted as first-class Episodic
+# properties on providers whose save queries write a full property map
+# (FalkorDB / Neo4j). First-class properties survive the full-map SET (a
+# post-hoc stamp would be wiped on the next re-save) and are indexable —
+# e.g. an :Episodic(entry_id) index for provenance backtraces.
+EPISODIC_PROVENANCE_KEYS = ('entry_id', 'thread_id', 'chunk_index', 'total_chunks')
+
+
 class EpisodicNode(Node):
     source: EpisodeType = Field(description='source type')
     source_description: str = Field(description='description of the data source')
@@ -349,6 +357,15 @@ class EpisodicNode(Node):
             'valid_at': self.valid_at,
             'source': self.source.value,
         }
+
+        if driver.provider in (GraphProvider.FALKORDB, GraphProvider.NEO4J):
+            # Persist whitelisted provenance metadata as node properties
+            # (see EPISODIC_PROVENANCE_KEYS). Gated to the providers whose
+            # save queries reference the params: Kuzu has a typed schema
+            # (unknown params error) and Neptune is untested for this.
+            meta = self.episode_metadata or {}
+            for key in EPISODIC_PROVENANCE_KEYS:
+                episode_args[key] = meta.get(key)
 
         result = await driver.execute_query(
             get_episode_node_save_query(driver.provider), **episode_args

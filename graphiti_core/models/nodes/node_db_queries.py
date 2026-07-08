@@ -54,14 +54,16 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
-                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
+                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at,
+                entry_id: $entry_id, thread_id: $thread_id, chunk_index: $chunk_index, total_chunks: $total_chunks}
                 RETURN n.uuid AS uuid
             """
         case _:  # Neo4j
             return """
                 MERGE (n:Episodic {uuid: $uuid})
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
-                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
+                entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at,
+                entry_id: $entry_id, thread_id: $thread_id, chunk_index: $chunk_index, total_chunks: $total_chunks}
                 RETURN n.uuid AS uuid
             """
 
@@ -96,7 +98,8 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 UNWIND $episodes AS episode
                 MERGE (n:Episodic {uuid: episode.uuid})
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description, source: episode.source, content: episode.content, 
-                entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at}
+                entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at,
+                entry_id: episode.entry_id, thread_id: episode.thread_id, chunk_index: episode.chunk_index, total_chunks: episode.total_chunks}
                 RETURN n.uuid AS uuid
             """
         case _:  # Neo4j
@@ -104,7 +107,8 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
                 UNWIND $episodes AS episode
                 MERGE (n:Episodic {uuid: episode.uuid})
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description, source: episode.source, content: episode.content, 
-                entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at}
+                entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at,
+                entry_id: episode.entry_id, thread_id: episode.thread_id, chunk_index: episode.chunk_index, total_chunks: episode.total_chunks}
                 RETURN n.uuid AS uuid
             """
 

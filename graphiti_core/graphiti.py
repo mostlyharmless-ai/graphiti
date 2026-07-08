@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import typing
 from datetime import datetime
 from time import time
 from uuid import uuid4
@@ -995,6 +996,7 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        episode_metadata: dict[str, typing.Any] | None = None,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -1108,6 +1110,7 @@ class Graphiti:
                         source_description=source_description,
                         created_at=now,
                         valid_at=reference_time,
+                        episode_metadata=episode_metadata,
                     )
                 )
 
@@ -1328,6 +1331,7 @@ class Graphiti:
                         group_id=group_id,
                         created_at=now,
                         valid_at=episode.reference_time,
+                        episode_metadata=episode.episode_metadata,
                     )
                     for episode in bulk_episodes
                 ]

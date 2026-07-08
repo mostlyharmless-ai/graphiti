@@ -40,7 +40,7 @@ from graphiti_core.models.nodes.node_db_queries import (
     get_entity_node_save_bulk_query,
     get_episode_node_save_bulk_query,
 )
-from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+from graphiti_core.nodes import EPISODIC_PROVENANCE_KEYS, EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 from graphiti_core.utils.maintenance.dedup_helpers import (
     DedupResolutionState,
@@ -105,6 +105,7 @@ class RawEpisode(BaseModel):
     source_description: str
     source: EpisodeType
     reference_time: datetime
+    episode_metadata: dict[str, Any] | None = Field(default=None)
 
 
 async def retrieve_previous_episodes_bulk(
@@ -158,9 +159,17 @@ async def add_nodes_and_edges_bulk_tx(
     driver: GraphDriver,
 ):
     episodes = [dict(episode) for episode in episodic_nodes]
+    stamp_provenance = driver.provider in (GraphProvider.FALKORDB, GraphProvider.NEO4J)
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
         episode.pop('labels', None)
+        if stamp_provenance:
+            # The bulk save queries for these providers reference the
+            # whitelisted provenance keys (see EPISODIC_PROVENANCE_KEYS);
+            # every episode dict must carry them, defaulting to null.
+            meta = episode.get('episode_metadata') or {}
+            for key in EPISODIC_PROVENANCE_KEYS:
+                episode[key] = meta.get(key)
 
     nodes = []
 
