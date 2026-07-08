@@ -28,7 +28,7 @@ from graphiti_core.models.nodes.node_db_queries import (
     get_episode_node_save_bulk_query,
     get_episode_node_save_query,
 )
-from graphiti_core.nodes import EpisodicNode
+from graphiti_core.nodes import EPISODIC_PROVENANCE_KEYS, EpisodicNode
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,12 @@ class Neo4jEpisodeNodeOperations(EpisodeNodeOperations):
             'valid_at': node.valid_at,
             'source': node.source.value,
         }
+        # The save query for this provider writes a full property map that
+        # includes the whitelisted provenance params (see
+        # EPISODIC_PROVENANCE_KEYS); they must always be present.
+        meta = node.episode_metadata or {}
+        for key in EPISODIC_PROVENANCE_KEYS:
+            params[key] = meta.get(key)
         if tx is not None:
             await tx.run(query, **params)
         else:
@@ -71,6 +77,11 @@ class Neo4jEpisodeNodeOperations(EpisodeNodeOperations):
             ep = dict(node)
             ep['source'] = str(ep['source'].value)
             ep.pop('labels', None)
+            # Same provenance contract as save(): the bulk query for this
+            # provider references the whitelisted keys on every episode.
+            meta = ep.get('episode_metadata') or {}
+            for key in EPISODIC_PROVENANCE_KEYS:
+                ep[key] = meta.get(key)
             episodes.append(ep)
 
         query = get_episode_node_save_bulk_query(GraphProvider.NEO4J)
