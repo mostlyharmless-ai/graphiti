@@ -232,6 +232,23 @@ def test_array_of_objects_gets_exemplar_item_and_field_docs():
     assert dedupe_example == {'duplicate_facts': [], 'contradicted_facts': []}
 
 
+def test_extracted_edges_exemplar_carries_item_shape():
+    # The other high-volume extraction model named in review: ExtractedEdges is
+    # edges: list[Edge] where Edge mixes required strs, optional nullable strs,
+    # and a scalar int array — the exemplar must validate and document all keys.
+    from graphiti_core.llm_client.openai_generic_client import example_instruction_for_model
+    from graphiti_core.prompts.extract_edges import Edge, ExtractedEdges
+
+    instruction = example_instruction_for_model(ExtractedEdges)
+    example = _extract_example_json(instruction)
+    assert len(example['edges']) == 1
+    item = example['edges'][0]
+    assert set(item.keys()) == set(Edge.model_fields.keys())
+    ExtractedEdges.model_validate(example)
+    for key in ('source_entity_name', 'target_entity_name', 'relation_type', 'fact'):
+        assert key in instruction
+
+
 @pytest.mark.asyncio
 async def test_non_retryable_error_is_not_retried():
     # The old hand-rolled re-prompt loop is gone. Retry is now delegated to the base
