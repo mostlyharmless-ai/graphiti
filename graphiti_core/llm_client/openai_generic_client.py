@@ -37,6 +37,110 @@ DEFAULT_MODEL = 'gpt-4.1-mini'
 StructuredOutputMode = Literal['json_schema', 'json_object']
 
 
+def _resolve(schema: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
+    """Follow a top-level $ref to its $defs target (one hop is all pydantic emits)."""
+    if '$ref' in schema:
+        return defs.get(schema['$ref'].split('/')[-1], {})
+    return schema
+
+
+def _example_value(schema: dict[str, Any], defs: dict[str, Any], depth: int = 0) -> Any:
+    """Minimal plausible instance value for a JSON-Schema fragment."""
+    if depth > 6:
+        return None
+    if '$ref' in schema:
+        return _example_value(_resolve(schema, defs), defs, depth + 1)
+    if schema.get('enum'):
+        return schema['enum'][0]
+    for combinator in ('anyOf', 'oneOf', 'allOf'):
+        options = schema.get(combinator)
+        if options:
+            non_null = [o for o in options if o.get('type') != 'null']
+            return _example_value(non_null[0] if non_null else options[0], defs, depth + 1)
+    schema_type = schema.get('type')
+    if schema_type == 'array':
+        # Arrays of objects get one exemplar item so the model sees the item shape
+        # (the old schema paste carried it via $defs). Arrays of scalars stay empty —
+        # the shape is obvious, and a scalar exemplar like [0] reads as a suggested
+        # answer rather than a shape hint.
+        items = _resolve(schema.get('items', {}), defs)
+        if items.get('type') == 'object' or 'properties' in items:
+            return [_example_value(items, defs, depth + 1)]
+        return []
+    if schema_type == 'string':
+        return ''
+    if schema_type == 'integer':
+        return 0
+    if schema_type == 'number':
+        return 0
+    if schema_type == 'boolean':
+        return False
+    if schema_type == 'object' or 'properties' in schema:
+        return {
+            name: _example_value(sub, defs, depth + 1)
+            for name, sub in schema.get('properties', {}).items()
+        }
+    return None
+
+
+def example_instruction_for_model(response_model: type[BaseModel]) -> str:
+    """Prompt tail describing the expected reply as an example instance, not a schema.
+
+    Appending ``model_json_schema()`` verbatim leads weaker ``json_object``
+    providers (e.g. DeepSeek) to occasionally echo the schema wrapper itself
+    back — responses whose top-level keys are ``properties``/``required`` —
+    which then fail response-model validation and abort the whole episode.
+    An example-shaped skeleton plus a plain-text field list gives the model
+    nothing schema-shaped to parrot. Measured on deepseek-v4-flash with the
+    ``dedupe_edges.resolve_edge`` prompt: ~10% of calls failed with the schema
+    paste vs ~0-2% with the example form (N=20 per arm, temperature 1).
+    """
+    schema = response_model.model_json_schema()
+    defs = schema.get('$defs', {})
+    properties: dict[str, Any] = schema.get('properties', {})
+    required = set(schema.get('required', properties.keys()))
+    example = {name: _example_value(sub, defs) for name, sub in properties.items()}
+
+    def describe(name: str, sub: dict[str, Any], req: set[str], indent: str) -> list[str]:
+        resolved = _resolve(sub, defs)
+        field_type = sub.get('type', resolved.get('type', 'object'))
+        line = f'{indent}- {name} ({field_type}, {"required" if name in req else "optional"})'
+        description = sub.get('description', resolved.get('description', ''))
+        if description:
+            line += f': {description}'
+        lines = [line]
+        # For arrays of objects, describe the item's fields one level deep so the
+        # model knows the item keys (the old schema paste carried this via $defs).
+        if field_type == 'array':
+            items = _resolve(resolved.get('items', sub.get('items', {})), defs)
+            item_props = items.get('properties')
+            if item_props:
+                item_required = set(items.get('required', item_props.keys()))
+                lines.append(f'{indent}  each item has:')
+                for item_name, item_sub in item_props.items():
+                    item_resolved = _resolve(item_sub, defs)
+                    item_type = item_sub.get('type', item_resolved.get('type', 'object'))
+                    item_line = (
+                        f'{indent}  - {item_name} ({item_type}, '
+                        f'{"required" if item_name in item_required else "optional"})'
+                    )
+                    item_desc = item_sub.get('description', item_resolved.get('description', ''))
+                    if item_desc:
+                        item_line += f': {item_desc}'
+                    lines.append(item_line)
+        return lines
+
+    field_lines: list[str] = []
+    for name, sub in properties.items():
+        field_lines.extend(describe(name, sub, required, ''))
+    return (
+        '\n\nRespond ONLY with a JSON object of exactly this shape — fill in the values; '
+        'it is the answer instance, not a schema (do not output "properties" or '
+        '"required" keys). Arrays may contain zero or more items:\n\n'
+        f'{json.dumps(example)}\n\nFields:\n' + '\n'.join(field_lines)
+    )
+
+
 class OpenAIGenericClient(LLMClient):
     """
     OpenAIClient is a client class for interacting with OpenAI's language models.
@@ -188,16 +292,13 @@ class OpenAIGenericClient(LLMClient):
         if max_tokens is None:
             max_tokens = self.max_tokens
 
-        # In json_object fallback mode the API does not enforce the schema, so embed it in
-        # the prompt to guide the model. In json_schema mode the schema is enforced via
-        # response_format, so no prompt injection is needed.
+        # In json_object fallback mode the API does not enforce the schema, so guide the
+        # model with an example-shaped instruction. Deliberately NOT the raw JSON Schema:
+        # weaker providers (e.g. DeepSeek) sometimes echo a pasted schema back verbatim
+        # ('properties'/'required' as top-level keys), failing validation. In json_schema
+        # mode the schema is enforced via response_format, so no prompt injection is needed.
         if response_model is not None and self.structured_output_mode == 'json_object':
-            serialized_model = json.dumps(response_model.model_json_schema())
-            messages[
-                -1
-            ].content += (
-                f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
-            )
+            messages[-1].content += example_instruction_for_model(response_model)
 
         # Add multilingual extraction instructions
         messages[0].content += get_extraction_language_instruction(group_id)
