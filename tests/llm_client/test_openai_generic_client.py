@@ -210,6 +210,28 @@ def test_example_value_handles_enum_anyof_and_scalars():
     assert _example_value({'type': 'boolean'}, {}) is False
 
 
+def test_array_of_objects_gets_exemplar_item_and_field_docs():
+    # The main extraction models are arrays of objects; the model needs the item
+    # shape (the old schema paste carried it via $defs). Scalar arrays stay [].
+    from graphiti_core.llm_client.openai_generic_client import example_instruction_for_model
+    from graphiti_core.prompts.extract_nodes import ExtractedEntities
+
+    instruction = example_instruction_for_model(ExtractedEntities)
+    example = _extract_example_json(instruction)
+    assert len(example['extracted_entities']) == 1
+    item = example['extracted_entities'][0]
+    assert set(item.keys()) == {'name', 'entity_type_id', 'episode_indices'}
+    ExtractedEntities.model_validate(example)
+    # Item fields documented one level deep.
+    assert 'each item has:' in instruction
+    assert 'entity_type_id' in instruction
+    # Scalar-array fields keep an empty-list example (no suggested answer bias).
+    from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
+
+    dedupe_example = _extract_example_json(example_instruction_for_model(EdgeDuplicate))
+    assert dedupe_example == {'duplicate_facts': [], 'contradicted_facts': []}
+
+
 @pytest.mark.asyncio
 async def test_non_retryable_error_is_not_retried():
     # The old hand-rolled re-prompt loop is gone. Retry is now delegated to the base
