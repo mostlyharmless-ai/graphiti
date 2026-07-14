@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   live-mcp-tests:
-    runs-on: depot-ubuntu-22.04
+    runs-on: ubuntu-latest
     environment: development
     # Insurance against a hung stdio subprocess / uv sync.
     timeout-minutes: 20
