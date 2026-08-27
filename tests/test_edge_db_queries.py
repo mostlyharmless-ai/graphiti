@@ -71,3 +71,15 @@ def test_entity_edge_return_query_selects_reference_time(provider):
         'invalid_at AS invalid_at',
     ):
         assert field in query
+
+
+def test_falkordb_single_save_stores_endpoint_uuids_as_edge_properties():
+    """watercooler fork storage contract: the MATCH-free FalkorDB search paths
+    read e.source_node_uuid / e.target_node_uuid, which the bulk save writes
+    (SET r = edge). The single save must write the same properties or edges
+    saved through EntityEdge.save() come back with null endpoints."""
+    from graphiti_core.models.edges.edge_db_queries import get_entity_edge_save_query
+
+    query = get_entity_edge_save_query(GraphProvider.FALKORDB)
+    assert 'e.source_node_uuid = $edge_data.source_uuid' in query
+    assert 'e.target_node_uuid = $edge_data.target_uuid' in query

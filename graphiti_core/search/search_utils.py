@@ -69,6 +69,14 @@ MAX_SEARCH_DEPTH = 3
 # WHERE filter (group_id, uuids, temporal) is applied, so in-scope neighbours outside
 # the global top-k were silently dropped. Oversample k when a filter is present.
 HNSW_OVERSAMPLE_FACTOR = 5
+# Adaptive widening: if a filtered HNSW pass returns fewer than ``limit`` rows,
+# retry with k multiplied by HNSW_WIDEN_FACTOR until ``limit`` rows are found or
+# k reaches HNSW_MAX_K (exhaustion). Bounded: 50 -> 200 -> 800 -> 3200 -> 4096.
+HNSW_WIDEN_FACTOR = 4
+HNSW_MAX_K = 4096
+# Explicit candidate sets at or below this size use the exact (non-index) cosine
+# path scoped to those uuids instead of hoping they surface in the global top-k.
+HNSW_EXACT_CANDIDATE_MAX = 64
 # watercooler fork mod: db.idx.vector.query* YIELD a cosine DISTANCE (0 = identical),
 # while graphiti scores are similarities in [0, 1] (see get_vector_cosine_func_query:
 # (2 - distance) / 2). Every HNSW path converts before min_score / ORDER BY.
@@ -477,6 +485,32 @@ async def edge_fulltext_search(
     return edges
 
 
+
+async def _hnsw_query_widening(
+    driver: GraphDriver,
+    query: str,
+    limit: int,
+    *,
+    filtered: bool,
+    **params: Any,
+) -> list[Any]:
+    """Run a FalkorDB HNSW query, widening k until ``limit`` filtered rows or HNSW_MAX_K.
+
+    ``db.idx.vector.query*`` return the GLOBAL top-k before WHERE filters, so a
+    scoped query can come back short even when qualifying rows exist. Unfiltered
+    queries run once with k == limit.
+    """
+    k = limit * HNSW_OVERSAMPLE_FACTOR if filtered else limit
+    k = min(k, HNSW_MAX_K)
+    while True:
+        records, _, _ = await driver.execute_query(
+            query, limit=limit, hnsw_k=k, routing_='r', **params
+        )
+        if not filtered or len(records) >= limit or k >= HNSW_MAX_K:
+            return records
+        k = min(k * HNSW_WIDEN_FACTOR, HNSW_MAX_K)
+
+
 async def edge_similarity_search(
     driver: GraphDriver,
     search_vector: list[float],
@@ -600,8 +634,13 @@ async def edge_similarity_search(
             )
         else:
             return []
-    elif driver.provider == GraphProvider.FALKORDB:
+    elif driver.provider == GraphProvider.FALKORDB and not (
+        search_filter.edge_uuids and len(search_filter.edge_uuids) <= HNSW_EXACT_CANDIDATE_MAX
+    ):
         # Use HNSW vector index for O(log n) search instead of O(n) full scan.
+        # Small explicit edge_uuids sets skip the index entirely and take the
+        # exact cosine path below, scoped to those candidates (dedup passes
+        # a handful of between-node edges; they need not be in the global top-k).
         # queryRelationships yields (relationship, score). The procedure returns
         # the GLOBAL top-k before any WHERE filter, so k is oversampled when a
         # filter is present (HNSW_OVERSAMPLE_FACTOR); the filtered rows are then
@@ -650,14 +689,9 @@ async def edge_similarity_search(
             LIMIT $limit
             """
             )
-            records, _, _ = await driver.execute_query(
-                query,
-                search_vector=search_vector,
-                limit=limit,
-                hnsw_k=limit * HNSW_OVERSAMPLE_FACTOR if mf_queries else limit,
-                min_score=min_score,
-                routing_='r',
-                **mf_params,
+            records = await _hnsw_query_widening(
+                driver, query, limit, filtered=bool(mf_queries),
+                search_vector=search_vector, min_score=min_score, **mf_params,
             )
             return [get_entity_edge_from_record(record, driver.provider) for record in records]
 
@@ -686,14 +720,9 @@ async def edge_similarity_search(
             """
         )
 
-        records, _, _ = await driver.execute_query(
-            query,
-            search_vector=search_vector,
-            limit=limit,
-            hnsw_k=limit * HNSW_OVERSAMPLE_FACTOR if filter_queries else limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
+        records = await _hnsw_query_widening(
+            driver, query, limit, filtered=bool(filter_queries),
+            search_vector=search_vector, min_score=min_score, **filter_params,
         )
     else:
         query = (
@@ -1052,14 +1081,9 @@ async def node_similarity_search(
             """
         )
 
-        records, _, _ = await driver.execute_query(
-            query,
-            search_vector=search_vector,
-            limit=limit,
-            hnsw_k=limit * HNSW_OVERSAMPLE_FACTOR if filter_queries else limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
+        records = await _hnsw_query_widening(
+            driver, query, limit, filtered=bool(filter_queries),
+            search_vector=search_vector, min_score=min_score, **filter_params,
         )
     else:
         query = (
