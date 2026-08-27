@@ -102,3 +102,20 @@ async def test_non_falkor_single_group_id_is_passthrough():
     assert driver.clone_calls == []
     assert host.seen_drivers == [None]
     assert result == ["q:None:['tenant']"]
+
+
+@pytest.mark.asyncio
+async def test_falkor_unified_group_ids_is_passthrough():
+    """watercooler fork mod: a unified database filters group_id as a property,
+    so neither single- nor multi-group routing may clone to a per-group graph."""
+    driver = _FakeDriver('project_db')
+    driver.unified_group_ids = True
+    host = _Host(driver)
+
+    single = await host.search('q', group_ids=['topic-a'])
+    multi = await host.search('q', group_ids=['topic-a', 'topic-b'])
+
+    assert driver.clone_calls == []
+    assert host.seen_drivers == [None, None]
+    assert single == ["q:None:['topic-a']"]
+    assert multi == ["q:None:['topic-a', 'topic-b']"]
