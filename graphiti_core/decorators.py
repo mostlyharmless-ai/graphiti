@@ -55,6 +55,11 @@ def handle_multiple_group_ids(func: F) -> F:
             and self.clients.driver.provider == GraphProvider.FALKORDB
         )
 
+        # watercooler fork mod: a unified database keeps every group_id as a property
+        # in ONE graph, so neither the single- nor multi-group clone routing applies.
+        if is_falkor and getattr(self.clients.driver, 'unified_group_ids', False):
+            return await func(self, *args, **kwargs)
+
         # FalkorDB: one group_id still needs the graph named after that id.
         # Clone is call-scoped so we never reassign self.driver / self.clients.driver.
         if is_falkor and group_ids and len(group_ids) == 1:

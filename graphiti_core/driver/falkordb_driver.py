@@ -138,6 +138,7 @@ class FalkorDriver(GraphDriver):
         password: str | None = None,
         falkor_db: FalkorDB | None = None,
         database: str = 'default_db',
+        unified_group_ids: bool = False,
     ):
         """
         Initialize the FalkorDB driver.
@@ -153,9 +154,14 @@ class FalkorDriver(GraphDriver):
         password (str | None): The password for authentication (if required).
         falkor_db (FalkorDB | None): An existing FalkorDB instance to use instead of creating a new one.
         database (str): The name of the database to connect to. Defaults to 'default_db'.
+        unified_group_ids (bool): watercooler fork mod. When True, ``group_id`` is a
+            property filter inside this single database and ``@handle_multiple_group_ids``
+            must NOT re-route reads to a graph named after the group_id (upstream #1670 /
+            #1675 graph-per-group semantics). Defaults to False (upstream behaviour).
         """
         super().__init__()
         self._database = database
+        self.unified_group_ids = unified_group_ids
         if falkor_db is not None:
             # If a FalkorDB instance is provided, use it directly
             self.client = falkor_db
@@ -336,10 +342,12 @@ class FalkorDriver(GraphDriver):
         if database == self._database:
             cloned = self
         elif database == self.default_group_id:
-            cloned = FalkorDriver(falkor_db=self.client)
+            cloned = FalkorDriver(falkor_db=self.client, unified_group_ids=self.unified_group_ids)
         else:
             # Create a new instance of FalkorDriver with the same connection but a different database
-            cloned = FalkorDriver(falkor_db=self.client, database=database)
+            cloned = FalkorDriver(
+                falkor_db=self.client, database=database, unified_group_ids=self.unified_group_ids
+            )
 
         return cloned
 
