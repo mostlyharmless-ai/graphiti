@@ -307,6 +307,7 @@ async def edge_search(
                     search_filter,
                     group_ids,
                     2 * limit,
+                    config.bfs_undirected,
                 )
             )
 
@@ -349,6 +350,7 @@ async def edge_search(
                         search_filter,
                         group_ids,
                         2 * limit,
+                        config.bfs_undirected,
                     )
                 )
 
@@ -515,6 +517,7 @@ async def node_search(
                     config.bfs_max_depth,
                     group_ids,
                     2 * limit,
+                    config.bfs_undirected,
                 )
             )
 
@@ -555,6 +558,7 @@ async def node_search(
                         config.bfs_max_depth,
                         group_ids,
                         2 * limit,
+                        config.bfs_undirected,
                     )
                 )
 

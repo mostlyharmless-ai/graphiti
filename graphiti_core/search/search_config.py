@@ -83,6 +83,10 @@ class EdgeSearchConfig(BaseModel):
     sim_min_score: float = Field(default=DEFAULT_MIN_SCORE)
     mmr_lambda: float = Field(default=DEFAULT_MMR_LAMBDA)
     bfs_max_depth: int = Field(default=MAX_SEARCH_DEPTH)
+    # watercooler fork mod: expand BFS along incoming edges as well as outgoing.
+    # Traversal direction only; the returned edge keeps its own direction, since
+    # n/m are taken from startNode/endNode rather than from traversal order.
+    bfs_undirected: bool = Field(default=False)
 
 
 class NodeSearchConfig(BaseModel):
@@ -91,6 +95,8 @@ class NodeSearchConfig(BaseModel):
     sim_min_score: float = Field(default=DEFAULT_MIN_SCORE)
     mmr_lambda: float = Field(default=DEFAULT_MMR_LAMBDA)
     bfs_max_depth: int = Field(default=MAX_SEARCH_DEPTH)
+    # watercooler fork mod: see EdgeSearchConfig.bfs_undirected.
+    bfs_undirected: bool = Field(default=False)
 
 
 class EpisodeSearchConfig(BaseModel):

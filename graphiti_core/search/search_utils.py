@@ -763,8 +763,19 @@ async def edge_bfs_search(
     search_filter: SearchFilters,
     group_ids: list[str] | None = None,
     limit: int = RELEVANT_SCHEMA_LIMIT,
+    bfs_undirected: bool = False,
 ) -> list[EntityEdge]:
+    # watercooler fork mod: ``bfs_undirected`` expands along incoming edges as
+    # well as outgoing ones. Only the traversal is undirected -- n and m still
+    # come from startNode/endNode, so each returned edge keeps its true
+    # direction. Paths that fail closed rather than silently traversing
+    # outgoing-only are preferred: a caller asking for both directions and
+    # getting one is the failure mode this flag exists to remove.
     if driver.search_interface:
+        if bfs_undirected:
+            raise NotImplementedError(
+                'undirected BFS is not supported by this driver search_interface'
+            )
         try:
             return await driver.search_interface.edge_bfs_search(
                 driver, bfs_origin_node_uuids, bfs_max_depth, search_filter, group_ids, limit
@@ -789,6 +800,11 @@ async def edge_bfs_search(
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
     if driver.provider == GraphProvider.KUZU:
+        if bfs_undirected:
+            # Kuzu models an entity edge as two hops through RelatesToNode_, so an
+            # undirected variable-length pattern would also match half-edges and
+            # change the depth semantics. Refuse rather than return a different graph.
+            raise NotImplementedError('undirected BFS is not implemented for Kuzu')
         # Kuzu stores entity edges twice with an intermediate node, so we need to match them
         # separately for the correct BFS depth.
         depth = bfs_max_depth * 2 - 1
@@ -828,11 +844,13 @@ async def edge_bfs_search(
             )
             records.extend(sub_records)
     else:
+        # watercooler fork mod: '>' for outgoing-only traversal, '' for undirected.
+        arrow = '' if bfs_undirected else '>'
         if driver.provider == GraphProvider.NEPTUNE:
             query = (
                 f"""
                 UNWIND $bfs_origin_node_uuids AS origin_uuid
-                MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS *1..{bfs_max_depth}]->(n:Entity)
+                MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS *1..{bfs_max_depth}]-{arrow}(n:Entity)
                 WHERE origin:Entity OR origin:Episodic
                 UNWIND relationships(path) AS rel
                 MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]-(m:Entity)
@@ -850,7 +868,7 @@ async def edge_bfs_search(
             query = (
                 f"""
                 UNWIND $bfs_origin_node_uuids AS origin_uuid
-                MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{bfs_max_depth}]->(:Entity)
+                MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{bfs_max_depth}]-{arrow}(:Entity)
                 UNWIND relationships(path) AS rel
                 WITH rel AS e, startNode(rel) AS n, endNode(rel) AS m
                 WHERE type(e) = 'RELATES_TO'
@@ -1126,8 +1144,14 @@ async def node_bfs_search(
     bfs_max_depth: int,
     group_ids: list[str] | None = None,
     limit: int = RELEVANT_SCHEMA_LIMIT,
+    bfs_undirected: bool = False,
 ) -> list[EntityNode]:
+    # watercooler fork mod: see edge_bfs_search for the direction contract.
     if driver.search_interface:
+        if bfs_undirected:
+            raise NotImplementedError(
+                'undirected BFS is not supported by this driver search_interface'
+            )
         try:
             return await driver.search_interface.node_bfs_search(
                 driver, bfs_origin_node_uuids, search_filter, bfs_max_depth, group_ids, limit
@@ -1151,10 +1175,13 @@ async def node_bfs_search(
     if filter_queries:
         filter_query = ' AND ' + (' AND '.join(filter_queries))
 
+    # watercooler fork mod: '>' for outgoing-only traversal, '' for undirected.
+    arrow = '' if bfs_undirected else '>'
+
     match_queries = [
         f"""
         UNWIND $bfs_origin_node_uuids AS origin_uuid
-        MATCH (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{bfs_max_depth}]->(n:Entity)
+        MATCH (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{bfs_max_depth}]-{arrow}(n:Entity)
         WHERE n.group_id = origin.group_id
         """
     ]
@@ -1163,13 +1190,15 @@ async def node_bfs_search(
         match_queries = [
             f"""
             UNWIND $bfs_origin_node_uuids AS origin_uuid
-            MATCH (origin {{uuid: origin_uuid}})-[e:RELATES_TO|MENTIONS*1..{bfs_max_depth}]->(n:Entity)
+            MATCH (origin {{uuid: origin_uuid}})-[e:RELATES_TO|MENTIONS*1..{bfs_max_depth}]-{arrow}(n:Entity)
             WHERE origin:Entity OR origin.Episode
             AND n.group_id = origin.group_id
             """
         ]
 
     if driver.provider == GraphProvider.KUZU:
+        if bfs_undirected:
+            raise NotImplementedError('undirected BFS is not implemented for Kuzu')
         depth = bfs_max_depth * 2
         match_queries = [
             """
