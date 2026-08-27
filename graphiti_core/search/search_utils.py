@@ -65,6 +65,13 @@ RELEVANT_SCHEMA_LIMIT = 10
 DEFAULT_MIN_SCORE = 0.6
 DEFAULT_MMR_LAMBDA = 0.5
 MAX_SEARCH_DEPTH = 3
+# watercooler fork mod: FalkorDB HNSW procedures return the GLOBAL top-k before any
+# WHERE filter (group_id, uuids, temporal) is applied, so in-scope neighbours outside
+# the global top-k were silently dropped. Oversample k when a filter is present.
+HNSW_OVERSAMPLE_FACTOR = 5
+# watercooler fork mod: db.idx.vector.query* YIELD a cosine DISTANCE (0 = identical),
+# while graphiti scores are similarities in [0, 1] (see get_vector_cosine_func_query:
+# (2 - distance) / 2). Every HNSW path converts before min_score / ORDER BY.
 MAX_QUERY_LENGTH = 128
 
 
@@ -500,6 +507,13 @@ async def edge_similarity_search(
             MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
         """
 
+    # watercooler fork mod: the filter constructor drops an empty edge_uuids list
+    # (avoids a no-op ``e.uuid IN []`` clause), which would turn "these specific
+    # edges, none" into an unfiltered group-wide cosine search. Mirror the
+    # fulltext short-circuit: no candidate edges means no results.
+    if search_filter.edge_uuids is not None and len(search_filter.edge_uuids) == 0:
+        return []
+
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, driver.provider
     )
@@ -588,9 +602,65 @@ async def edge_similarity_search(
             return []
     elif driver.provider == GraphProvider.FALKORDB:
         # Use HNSW vector index for O(log n) search instead of O(n) full scan.
-        # queryRelationships yields (relationship, score); we join to get (n, m)
-        # for source/target UUIDs. The index already limits to $limit results so
-        # no oversample trick is needed here (unlike the fulltext path).
+        # queryRelationships yields (relationship, score). The procedure returns
+        # the GLOBAL top-k before any WHERE filter, so k is oversampled when a
+        # filter is present (HNSW_OVERSAMPLE_FACTOR); the filtered rows are then
+        # re-limited to $limit.
+        if search_filter.node_labels is None:
+            # MATCH-free path (mirrors the fulltext path): source_node_uuid /
+            # target_node_uuid are stored as edge properties, so the per-row
+            # MATCH (n)-[e {uuid}]->(m) JOIN — the dominant cost once k is
+            # oversampled — is not needed. node_labels filters reference n/m
+            # and fall through to the MATCH path below.
+            mf_queries, mf_params = edge_search_filter_query_constructor(
+                search_filter, driver.provider
+            )
+            if group_ids is not None:
+                mf_queries.append('e.group_id IN $group_ids')
+                mf_params['group_ids'] = group_ids
+                if source_node_uuid is not None:
+                    mf_params['source_uuid'] = source_node_uuid
+                    mf_queries.append('e.source_node_uuid = $source_uuid')
+                if target_node_uuid is not None:
+                    mf_params['target_uuid'] = target_node_uuid
+                    mf_queries.append('e.target_node_uuid = $target_uuid')
+            conditions = mf_queries + ['score > $min_score']
+            query = (
+                """
+            CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', $hnsw_k, vecf32($search_vector))
+            YIELD relationship AS rel, score
+            WITH rel AS e, (2 - score) / 2 AS score
+            WHERE """
+                + ' AND '.join(conditions)
+                + """
+            RETURN
+                e.uuid AS uuid,
+                e.source_node_uuid AS source_node_uuid,
+                e.target_node_uuid AS target_node_uuid,
+                e.group_id AS group_id,
+                e.created_at AS created_at,
+                e.name AS name,
+                e.fact AS fact,
+                e.episodes AS episodes,
+                e.expired_at AS expired_at,
+                e.valid_at AS valid_at,
+                e.invalid_at AS invalid_at,
+                properties(e) AS attributes
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+            )
+            records, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                limit=limit,
+                hnsw_k=limit * HNSW_OVERSAMPLE_FACTOR if mf_queries else limit,
+                min_score=min_score,
+                routing_='r',
+                **mf_params,
+            )
+            return [get_entity_edge_from_record(record, driver.provider) for record in records]
+
         conditions = filter_queries.copy()
         conditions.append('score > $min_score')
         where_clause = ''
@@ -599,8 +669,9 @@ async def edge_similarity_search(
 
         query = (
             """
-            CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', $limit, vecf32($search_vector))
+            CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', $hnsw_k, vecf32($search_vector))
             YIELD relationship AS rel, score
+            WITH rel, (2 - score) / 2 AS score
             MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
             """
             + where_clause
@@ -619,6 +690,7 @@ async def edge_similarity_search(
             query,
             search_vector=search_vector,
             limit=limit,
+            hnsw_k=limit * HNSW_OVERSAMPLE_FACTOR if filter_queries else limit,
             min_score=min_score,
             routing_='r',
             **filter_params,
@@ -965,8 +1037,9 @@ async def node_similarity_search(
 
         query = (
             """
-            CALL db.idx.vector.queryNodes('Entity', 'name_embedding', $limit, vecf32($search_vector))
+            CALL db.idx.vector.queryNodes('Entity', 'name_embedding', $hnsw_k, vecf32($search_vector))
             YIELD node AS n, score
+            WITH n, (2 - score) / 2 AS score
             """
             + where_clause
             + """
@@ -983,6 +1056,7 @@ async def node_similarity_search(
             query,
             search_vector=search_vector,
             limit=limit,
+            hnsw_k=limit * HNSW_OVERSAMPLE_FACTOR if filter_queries else limit,
             min_score=min_score,
             routing_='r',
             **filter_params,
