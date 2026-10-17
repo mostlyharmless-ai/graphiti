@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from graphiti_core.driver.falkordb import fulltext
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_utils import rrf
 
@@ -66,3 +67,52 @@ def test_max_fulltext_terms_default_and_env_override():
     assert _module_value(mod, 'MAX_FULLTEXT_TERMS', {}) == '6'
     env = {'GRAPHITI_MAX_FULLTEXT_TERMS': '20'}
     assert _module_value(mod, 'MAX_FULLTEXT_TERMS', env) == '20'
+
+
+# --- Fulltext term selection -----------------------------------------------------
+
+
+def test_select_first_keeps_query_order_prefix():
+    words = ['Sync', 'the', 'queue', 'reconciliation', 'daemon', 'backoff']
+    assert fulltext.select_fulltext_terms(words, 3, 'first') == ['Sync', 'the', 'queue']
+
+
+def test_select_rare_keeps_longest_terms_in_query_order():
+    words = ['Sync', 'queue', 'reconciliation', 'daemon', 'backoff', 'retry']
+    # longest: reconciliation(14), backoff(7), daemon(6); returned in query order
+    got = fulltext.select_fulltext_terms(words, 3, 'rare')
+    assert got == ['reconciliation', 'daemon', 'backoff']
+
+
+def test_select_rare_breaks_length_ties_by_position():
+    words = ['alpha', 'bravo', 'delta', 'kilo']
+    assert fulltext.select_fulltext_terms(words, 2, 'rare') == ['alpha', 'bravo']
+
+
+def test_select_rare_under_the_cap_is_unchanged():
+    words = ['b', 'aaa', 'cc']
+    assert fulltext.select_fulltext_terms(words, 5, 'rare') == words
+
+
+def test_builder_uses_module_selection(monkeypatch):
+    monkeypatch.setattr(fulltext, 'MAX_FULLTEXT_TERMS', 2)
+    monkeypatch.setattr(fulltext, 'FULLTEXT_TERM_SELECTION', 'rare')
+    q = fulltext.build_falkor_fulltext_query('Sync queue reconciliation daemon')
+    assert q == ' (reconciliation | daemon)'
+    monkeypatch.setattr(fulltext, 'FULLTEXT_TERM_SELECTION', 'first')
+    assert fulltext.build_falkor_fulltext_query('Sync queue reconciliation daemon') == (
+        ' (Sync | queue)'
+    )
+
+
+def test_term_selection_default_env_override_and_rejection():
+    mod = 'graphiti_core.driver.falkordb.fulltext'
+    assert _module_value(mod, 'FULLTEXT_TERM_SELECTION', {}) == "'first'"
+    env = {'GRAPHITI_FULLTEXT_TERM_SELECTION': 'rare'}
+    assert _module_value(mod, 'FULLTEXT_TERM_SELECTION', env) == "'rare'"
+    try:
+        _module_value(mod, 'FULLTEXT_TERM_SELECTION', {'GRAPHITI_FULLTEXT_TERM_SELECTION': 'x'})
+    except subprocess.CalledProcessError as error:
+        assert 'GRAPHITI_FULLTEXT_TERM_SELECTION' in error.stderr
+    else:
+        raise AssertionError('an unknown selection must fail at import')

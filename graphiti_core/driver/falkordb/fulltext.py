@@ -16,6 +16,18 @@ MAX_QUERY_LENGTH = 128
 # entry-length query is reduced to roughly its title.
 MAX_FULLTEXT_TERMS = int(os.environ.get('GRAPHITI_MAX_FULLTEXT_TERMS', '6'))
 
+# Which distinct terms survive the cap: 'first' (default, unchanged) keeps the first N
+# in query order; 'rare' keeps the N most specific. Document frequency is not available
+# here (the builder has no driver), so 'rare' uses a proxy: longest terms first, ties by
+# position. Override with GRAPHITI_FULLTEXT_TERM_SELECTION.
+FULLTEXT_TERM_SELECTIONS = ('first', 'rare')
+FULLTEXT_TERM_SELECTION = os.environ.get('GRAPHITI_FULLTEXT_TERM_SELECTION', 'first')
+if FULLTEXT_TERM_SELECTION not in FULLTEXT_TERM_SELECTIONS:
+    raise ValueError(
+        f'GRAPHITI_FULLTEXT_TERM_SELECTION must be one of {FULLTEXT_TERM_SELECTIONS}, '
+        f'got {FULLTEXT_TERM_SELECTION!r}'
+    )
+
 # FalkorDB separator characters that break text into tokens.
 _SEPARATOR_MAP = str.maketrans(
     {
@@ -64,6 +76,20 @@ def _escape_fulltext_group_id(group_id: str) -> str:
     return re.sub(r'([^a-zA-Z0-9])', r'\\\1', group_id)
 
 
+def select_fulltext_terms(
+    words: list[str],
+    limit: int | None = None,
+    selection: str | None = None,
+) -> list[str]:
+    """Keep `limit` of the distinct `words` by `selection`, in their query order."""
+    limit = MAX_FULLTEXT_TERMS if limit is None else limit
+    selection = FULLTEXT_TERM_SELECTION if selection is None else selection
+    if selection == 'first' or len(words) <= limit:
+        return words[:limit]
+    keep = sorted(range(len(words)), key=lambda i: (-len(words[i]), i))[:limit]
+    return [words[i] for i in sorted(keep)]
+
+
 def build_falkor_fulltext_query(
     query: str,
     group_ids: list[str] | None = None,
@@ -93,7 +119,7 @@ def build_falkor_fulltext_query(
         if key not in seen:
             seen.add(key)
             unique_words.append(word)
-    filtered_words = unique_words[:MAX_FULLTEXT_TERMS]
+    filtered_words = select_fulltext_terms(unique_words)
 
     sanitized_query = ' | '.join(filtered_words)
     if len(sanitized_query.split(' ')) + len(group_ids or []) >= max_query_length:
