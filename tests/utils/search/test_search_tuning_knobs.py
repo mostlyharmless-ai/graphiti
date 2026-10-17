@@ -5,9 +5,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.falkordb import fulltext
 from graphiti_core.search import search, search_utils
 from graphiti_core.search.search_config import EdgeReranker, EdgeSearchConfig, EdgeSearchMethod
@@ -154,3 +156,46 @@ def test_candidate_multiplier_default_and_env_override():
     assert _module_value(mod, 'SEARCH_CANDIDATE_MULTIPLIER', {}) == '2'
     env = {'GRAPHITI_SEARCH_CANDIDATE_MULTIPLIER': '4'}
     assert _module_value(mod, 'SEARCH_CANDIDATE_MULTIPLIER', env) == '4'
+
+
+# --- FalkorDB edge-embedding load ---------------------------------------------------
+
+
+class _EmbeddingDriver:
+    graph_operations_interface = None
+    search_interface = None
+
+    def __init__(self, provider):
+        self.provider = provider
+        self.calls = []
+
+    async def execute_query(self, query, **kwargs):
+        self.calls.append((query, kwargs))
+        return (
+            [{'uuid': 'e1', 'fact_embedding': [1.0, 0.0]}, {'uuid': 'e2', 'fact_embedding': None}],
+            None,
+            None,
+        )
+
+
+def _edge(uuid):
+    return SimpleNamespace(uuid=uuid)
+
+
+@pytest.mark.asyncio
+async def test_falkordb_edge_embeddings_use_a_directed_label_free_match():
+    driver = _EmbeddingDriver(GraphProvider.FALKORDB)
+    got = await search_utils.get_embeddings_for_edges(driver, [_edge('e1'), _edge('e2')])
+    query, kwargs = driver.calls[0]
+    flat = ' '.join(query.split())
+    assert 'MATCH ()-[e:RELATES_TO]->()' in flat
+    assert ':Entity' not in flat
+    assert kwargs['edge_uuids'] == ['e1', 'e2']
+    assert got == {'e1': [1.0, 0.0]}
+
+
+@pytest.mark.asyncio
+async def test_neo4j_edge_embeddings_keep_the_generic_match():
+    driver = _EmbeddingDriver(GraphProvider.NEO4J)
+    await search_utils.get_embeddings_for_edges(driver, [_edge('e1')])
+    assert '(n:Entity)-[e:RELATES_TO]-(m:Entity)' in driver.calls[0][0]
