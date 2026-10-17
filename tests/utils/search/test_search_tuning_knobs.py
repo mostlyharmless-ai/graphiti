@@ -6,8 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from graphiti_core.driver.falkordb import fulltext
-from graphiti_core.search import search_utils
+from graphiti_core.search import search, search_utils
+from graphiti_core.search.search_config import EdgeReranker, EdgeSearchConfig, EdgeSearchMethod
+from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import rrf
 
 REPO = Path(__file__).resolve().parents[3]
@@ -116,3 +120,37 @@ def test_term_selection_default_env_override_and_rejection():
         assert 'GRAPHITI_FULLTEXT_TERM_SELECTION' in error.stderr
     else:
         raise AssertionError('an unknown selection must fail at import')
+
+
+# --- Candidate multiplier --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('multiplier', [2, 4])
+async def test_edge_search_fetches_multiplier_times_limit_per_leg(monkeypatch, multiplier):
+    seen = {}
+
+    async def fulltext_leg(driver, query, search_filter, group_ids, limit):
+        seen['bm25'] = limit
+        return []
+
+    async def cosine_leg(driver, vector, src, tgt, search_filter, group_ids, limit, min_score):
+        seen['cosine'] = limit
+        return []
+
+    monkeypatch.setattr(search, 'edge_fulltext_search', fulltext_leg)
+    monkeypatch.setattr(search, 'edge_similarity_search', cosine_leg)
+    monkeypatch.setattr(search, 'SEARCH_CANDIDATE_MULTIPLIER', multiplier)
+    config = EdgeSearchConfig(
+        search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity],
+        reranker=EdgeReranker.rrf,
+    )
+    await search.edge_search(None, None, 'q', [0.0], None, config, SearchFilters(), limit=50)
+    assert seen == {'bm25': 50 * multiplier, 'cosine': 50 * multiplier}
+
+
+def test_candidate_multiplier_default_and_env_override():
+    mod = 'graphiti_core.search.search'
+    assert _module_value(mod, 'SEARCH_CANDIDATE_MULTIPLIER', {}) == '2'
+    env = {'GRAPHITI_SEARCH_CANDIDATE_MULTIPLIER': '4'}
+    assert _module_value(mod, 'SEARCH_CANDIDATE_MULTIPLIER', env) == '4'
