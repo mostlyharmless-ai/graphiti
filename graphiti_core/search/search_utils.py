@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import os
 from collections import defaultdict
 from time import time
 from typing import Any
@@ -2137,10 +2138,19 @@ async def get_edge_invalidation_candidates(
     return invalidation_edges
 
 
+# watercooler fork mod: the RRF rank constant used when a caller does not pass one.
+# Upstream hard-codes 1, which lets one leg's top hit (score 1.0) outrank an item
+# another leg ranks first but the first leg missed; standard RRF uses 60.
+# Default unchanged (1); override with GRAPHITI_RRF_RANK_CONST.
+RRF_RANK_CONST = int(os.environ.get('GRAPHITI_RRF_RANK_CONST', '1'))
+
+
 # takes in a list of rankings of uuids
 def rrf(
-    results: list[list[str]], rank_const=1, min_score: float = 0
+    results: list[list[str]], rank_const: int | None = None, min_score: float = 0
 ) -> tuple[list[str], list[float]]:
+    if rank_const is None:
+        rank_const = RRF_RANK_CONST
     scores: dict[str, float] = defaultdict(float)
     for result in results:
         for i, uuid in enumerate(result):
