@@ -56,3 +56,13 @@ def test_rrf_rank_const_default_and_env_override():
     mod = 'graphiti_core.search.search_utils'
     assert _module_value(mod, 'RRF_RANK_CONST', {}) == '1'
     assert _module_value(mod, 'RRF_RANK_CONST', {'GRAPHITI_RRF_RANK_CONST': '60'}) == '60'
+
+
+# --- Fulltext term cap -----------------------------------------------------------
+
+
+def test_max_fulltext_terms_default_and_env_override():
+    mod = 'graphiti_core.driver.falkordb.fulltext'
+    assert _module_value(mod, 'MAX_FULLTEXT_TERMS', {}) == '6'
+    env = {'GRAPHITI_MAX_FULLTEXT_TERMS': '20'}
+    assert _module_value(mod, 'MAX_FULLTEXT_TERMS', env) == '20'

@@ -1,5 +1,6 @@
 """Shared FalkorDB fulltext-query construction."""
 
+import os
 import re
 
 from graphiti_core.driver.falkordb import STOPWORDS
@@ -11,7 +12,9 @@ MAX_QUERY_LENGTH = 128
 # on queries with many OR terms because it must scan and union results per term;
 # 8-10+ terms were observed to time out during episode indexing on large graphs.
 # Keep the first N distinct terms — the most important keywords.
-MAX_FULLTEXT_TERMS = 6
+# Default unchanged (6); override with GRAPHITI_MAX_FULLTEXT_TERMS. With 6, an
+# entry-length query is reduced to roughly its title.
+MAX_FULLTEXT_TERMS = int(os.environ.get('GRAPHITI_MAX_FULLTEXT_TERMS', '6'))
 
 # FalkorDB separator characters that break text into tokens.
 _SEPARATOR_MAP = str.maketrans(
