@@ -199,3 +199,74 @@ async def test_neo4j_edge_embeddings_keep_the_generic_match():
     driver = _EmbeddingDriver(GraphProvider.NEO4J)
     await search_utils.get_embeddings_for_edges(driver, [_edge('e1')])
     assert '(n:Entity)-[e:RELATES_TO]-(m:Entity)' in driver.calls[0][0]
+
+
+# --- rrf_cosine edge reranker ---------------------------------------------------------
+
+Q = [1.0, 0.0]
+
+
+def test_cosine_order_sorts_by_similarity():
+    emb = {'far': [0.0, 1.0], 'near': [1.0, 0.1], 'mid': [1.0, 1.0]}
+    uuids, scores = search_utils.cosine_order(Q, ['far', 'mid', 'near'], emb, min_score=-1)
+    assert uuids == ['near', 'mid', 'far']
+    assert scores == sorted(scores, reverse=True)
+    assert abs(scores[1] - 2**-0.5) < 1e-9
+
+
+def test_cosine_order_ties_keep_fused_order():
+    emb = {'a': [2.0, 2.0], 'b': [1.0, 1.0], 'c': [1.0, 0.0]}
+    assert search_utils.cosine_order(Q, ['a', 'b', 'c'], emb)[0] == ['c', 'a', 'b']
+    assert search_utils.cosine_order(Q, ['b', 'a', 'c'], emb)[0] == ['c', 'b', 'a']
+
+
+def test_cosine_order_missing_embeddings_follow_in_fused_order():
+    emb = {'b': [0.0, 1.0], 'd': [1.0, 0.0], 'e': []}
+    uuids, scores = search_utils.cosine_order(Q, ['a', 'b', 'c', 'd', 'e'], emb)
+    assert uuids == ['d', 'b', 'a', 'c', 'e']
+    assert scores[2:] == [0.0, 0.0, 0.0]
+
+
+def test_cosine_order_min_score_drops_scored_only():
+    emb = {'neg': [-1.0, 0.1], 'low': [1.0, 3.0], 'high': [1.0, 0.0]}
+    uuids, scores = search_utils.cosine_order(Q, ['neg', 'low', 'none', 'high'], emb, min_score=0.5)
+    assert uuids == ['high', 'none']
+    assert scores == [1.0, 0.0]
+    # the default (0) drops negative similarity only
+    assert search_utils.cosine_order(Q, ['neg', 'low'], emb)[0] == ['low']
+
+
+def _edges(*uuids):
+    return [SimpleNamespace(uuid=u, source_node_uuid='s', episodes=[]) for u in uuids]
+
+
+@pytest.mark.asyncio
+async def test_edge_search_rrf_cosine_reorders_the_fused_cut(monkeypatch):
+    # Legs: bm25 a, b, c, z; cosine b, d. Fused (rank_const 1): b, a, d, c, z -> cut 3 -> b, a, d.
+    async def fulltext_leg(driver, query, search_filter, group_ids, limit):
+        return _edges('a', 'b', 'c', 'z')
+
+    async def cosine_leg(driver, vector, src, tgt, search_filter, group_ids, limit, min_score):
+        return _edges('b', 'd')
+
+    loaded = []
+
+    async def load(driver, edges):
+        loaded.append([e.uuid for e in edges])
+        # z would win on cosine but sits below the cut; a has no embedding
+        return {'b': [0.0, 1.0], 'd': [1.0, 0.2], 'z': [1.0, 0.0], 'c': [1.0, 0.0]}
+
+    monkeypatch.setattr(search, 'edge_fulltext_search', fulltext_leg)
+    monkeypatch.setattr(search, 'edge_similarity_search', cosine_leg)
+    monkeypatch.setattr(search, 'get_embeddings_for_edges', load)
+    monkeypatch.setattr(search_utils, 'RRF_RANK_CONST', 1)
+    config = EdgeSearchConfig(
+        search_methods=[EdgeSearchMethod.bm25, EdgeSearchMethod.cosine_similarity],
+        reranker=EdgeReranker.rrf_cosine,
+    )
+    edges, scores = await search.edge_search(
+        None, None, 'q', Q, None, config, SearchFilters(), limit=3
+    )
+    assert loaded == [['b', 'a', 'd']]
+    assert [e.uuid for e in edges] == ['d', 'b', 'a']
+    assert scores[-1] == 0.0

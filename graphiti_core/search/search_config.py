@@ -56,6 +56,9 @@ class EdgeReranker(Enum):
     episode_mentions = 'episode_mentions'
     mmr = 'mmr'
     cross_encoder = 'cross_encoder'
+    # watercooler fork mod: RRF-fuse the legs and cut to the limit (the rrf candidate
+    # set), then order those edges by cosine between the query and their fact embedding.
+    rrf_cosine = 'rrf_cosine'
 
 
 class NodeReranker(Enum):

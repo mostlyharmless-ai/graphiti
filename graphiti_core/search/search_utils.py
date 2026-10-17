@@ -2166,6 +2166,35 @@ def rrf(
     ]
 
 
+def cosine_order(
+    query_vector: list[float],
+    uuids: list[str],
+    embeddings: dict[str, list[float]],
+    min_score: float = 0,
+) -> tuple[list[str], list[float]]:
+    """Order `uuids` by cosine similarity between `query_vector` and each embedding.
+
+    watercooler fork mod, the second stage of EdgeReranker.rrf_cosine. Highest
+    similarity first; ties keep their order in `uuids`. Embeddings scoring below
+    `min_score` are dropped (as the mmr reranker drops scores below its min_score).
+    uuids without an embedding cannot be scored: they follow the scored ones in their
+    original order with score 0.0 and are never dropped by `min_score`.
+    """
+    query = normalize_l2(query_vector)
+    scored: list[tuple[float, int, str]] = []
+    unscored: list[str] = []
+    for position, uuid in enumerate(uuids):
+        embedding = embeddings.get(uuid)
+        if embedding is None or len(embedding) == 0:
+            unscored.append(uuid)
+            continue
+        score = float(np.dot(query, normalize_l2(embedding)))
+        if score >= min_score:
+            scored.append((score, position, uuid))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [u for _, _, u in scored] + unscored, [s for s, _, _ in scored] + [0.0] * len(unscored)
+
+
 async def node_distance_reranker(
     driver: GraphDriver,
     node_uuids: list[str],
