@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import os
 from collections import defaultdict
 from time import time
 from typing import Any
@@ -2137,10 +2138,19 @@ async def get_edge_invalidation_candidates(
     return invalidation_edges
 
 
+# watercooler fork mod: the RRF rank constant used when a caller does not pass one.
+# Upstream hard-codes 1, which lets one leg's top hit (score 1.0) outrank an item
+# another leg ranks first but the first leg missed; standard RRF uses 60.
+# Default unchanged (1); override with GRAPHITI_RRF_RANK_CONST.
+RRF_RANK_CONST = int(os.environ.get('GRAPHITI_RRF_RANK_CONST', '1'))
+
+
 # takes in a list of rankings of uuids
 def rrf(
-    results: list[list[str]], rank_const=1, min_score: float = 0
+    results: list[list[str]], rank_const: int | None = None, min_score: float = 0
 ) -> tuple[list[str], list[float]]:
+    if rank_const is None:
+        rank_const = RRF_RANK_CONST
     scores: dict[str, float] = defaultdict(float)
     for result in results:
         for i, uuid in enumerate(result):
@@ -2154,6 +2164,35 @@ def rrf(
     return [uuid for uuid in sorted_uuids if scores[uuid] >= min_score], [
         scores[uuid] for uuid in sorted_uuids if scores[uuid] >= min_score
     ]
+
+
+def cosine_order(
+    query_vector: list[float],
+    uuids: list[str],
+    embeddings: dict[str, list[float]],
+    min_score: float = 0,
+) -> tuple[list[str], list[float]]:
+    """Order `uuids` by cosine similarity between `query_vector` and each embedding.
+
+    watercooler fork mod, the second stage of EdgeReranker.rrf_cosine. Highest
+    similarity first; ties keep their order in `uuids`. Embeddings scoring below
+    `min_score` are dropped (as the mmr reranker drops scores below its min_score).
+    uuids without an embedding cannot be scored: they follow the scored ones in their
+    original order with score 0.0 and are never dropped by `min_score`.
+    """
+    query = normalize_l2(query_vector)
+    scored: list[tuple[float, int, str]] = []
+    unscored: list[str] = []
+    for position, uuid in enumerate(uuids):
+        embedding = embeddings.get(uuid)
+        if embedding is None or len(embedding) == 0:
+            unscored.append(uuid)
+            continue
+        score = float(np.dot(query, normalize_l2(embedding)))
+        if score >= min_score:
+            scored.append((score, position, uuid))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [u for _, _, u in scored] + unscored, [s for s, _, _ in scored] + [0.0] * len(unscored)
 
 
 async def node_distance_reranker(
@@ -2390,6 +2429,19 @@ async def get_embeddings_for_edges(
         RETURN DISTINCT
             e.uuid AS uuid,
             split(e.fact_embedding, ",") AS fact_embedding
+        """
+    elif driver.provider == GraphProvider.FALKORDB:
+        # watercooler fork mod: a directed, label-free match lets FalkorDB resolve the
+        # uuids through the RELATES_TO uuid range index. The generic undirected
+        # (n:Entity)-[e]-(m:Entity) pattern scans the edge set: 50 uuids took 2.98 s on a
+        # 230k-edge graph against 0.03 s here, same rows. Every RELATES_TO edge joins two Entity
+        # nodes, so the result set is the same, and each edge matches once.
+        query = """
+        MATCH ()-[e:RELATES_TO]->()
+        WHERE e.uuid IN $edge_uuids
+        RETURN
+            e.uuid AS uuid,
+            e.fact_embedding AS fact_embedding
         """
     else:
         match_query = """

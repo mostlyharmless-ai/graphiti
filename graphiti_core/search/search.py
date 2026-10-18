@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -49,6 +50,7 @@ from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import (
     community_fulltext_search,
     community_similarity_search,
+    cosine_order,
     edge_bfs_search,
     edge_fulltext_search,
     edge_similarity_search,
@@ -67,6 +69,11 @@ from graphiti_core.search.search_utils import (
 from graphiti_core.tracer import NoOpTracer, Tracer
 
 logger = logging.getLogger(__name__)
+
+# watercooler fork mod: each edge/node search method fetches this many times `limit`
+# candidates before fusion cuts the list to `limit`. Default unchanged (2); override with
+# GRAPHITI_SEARCH_CANDIDATE_MULTIPLIER. Episode and community search keep 2.
+SEARCH_CANDIDATE_MULTIPLIER = int(os.environ.get('GRAPHITI_SEARCH_CANDIDATE_MULTIPLIER', '2'))
 
 
 def _enum_value(value: Any) -> Any:
@@ -123,6 +130,7 @@ async def search(
             and EdgeSearchMethod.cosine_similarity in config.edge_config.search_methods
         )
         or (config.edge_config and EdgeReranker.mmr == config.edge_config.reranker)
+        or (config.edge_config and EdgeReranker.rrf_cosine == config.edge_config.reranker)
         or (
             config.node_config
             and NodeSearchMethod.cosine_similarity in config.node_config.search_methods
@@ -267,6 +275,7 @@ async def edge_search(
     if config is None:
         return [], []
     search_tracer = _resolve_tracer(search_tracer)
+    candidate_limit = SEARCH_CANDIDATE_MULTIPLIER * limit
 
     with _trace_phase(
         search_tracer,
@@ -283,7 +292,7 @@ async def edge_search(
         search_tasks = []
         if EdgeSearchMethod.bm25 in config.search_methods:
             search_tasks.append(
-                edge_fulltext_search(driver, query, search_filter, group_ids, 2 * limit)
+                edge_fulltext_search(driver, query, search_filter, group_ids, candidate_limit)
             )
         if EdgeSearchMethod.cosine_similarity in config.search_methods:
             search_tasks.append(
@@ -294,7 +303,7 @@ async def edge_search(
                     None,
                     search_filter,
                     group_ids,
-                    2 * limit,
+                    candidate_limit,
                     config.sim_min_score,
                 )
             )
@@ -306,7 +315,7 @@ async def edge_search(
                     config.bfs_max_depth,
                     search_filter,
                     group_ids,
-                    2 * limit,
+                    candidate_limit,
                     config.bfs_undirected,
                 )
             )
@@ -319,7 +328,7 @@ async def edge_search(
                 'search.edge_search.execute_methods',
                 {
                     'method_count': len(search_tasks),
-                    'candidate_limit': 2 * limit,
+                    'candidate_limit': candidate_limit,
                 },
             ) as method_span:
                 search_results = list(await semaphore_gather(*search_tasks))
@@ -339,7 +348,7 @@ async def edge_search(
                 'search.edge_search.expand_bfs',
                 {
                     'origin_node_count': len(source_node_uuids),
-                    'candidate_limit': 2 * limit,
+                    'candidate_limit': candidate_limit,
                 },
             ):
                 search_results.append(
@@ -349,7 +358,7 @@ async def edge_search(
                         config.bfs_max_depth,
                         search_filter,
                         group_ids,
-                        2 * limit,
+                        candidate_limit,
                         config.bfs_undirected,
                     )
                 )
@@ -374,6 +383,22 @@ async def edge_search(
                 search_result_uuids = [[edge.uuid for edge in result] for result in search_results]
 
                 reranked_uuids, edge_scores = rrf(search_result_uuids, min_score=reranker_min_score)
+            elif config.reranker == EdgeReranker.rrf_cosine:
+                # The rrf candidate set (fused, cut to limit), reordered by cosine to the
+                # query. reranker_min_score applies to the cosine scores, not to RRF.
+                fused_uuids, _ = rrf([[edge.uuid for edge in result] for result in search_results])
+                fused_uuids = fused_uuids[:limit]
+                with _trace_phase(
+                    search_tracer,
+                    'search.edge_search.load_embeddings',
+                    {'candidate_count': len(fused_uuids)},
+                ):
+                    fused_embeddings = await get_embeddings_for_edges(
+                        driver, [edge_uuid_map[uuid] for uuid in fused_uuids]
+                    )
+                reranked_uuids, edge_scores = cosine_order(
+                    query_vector, fused_uuids, fused_embeddings, reranker_min_score
+                )
             elif config.reranker == EdgeReranker.mmr:
                 with _trace_phase(
                     search_tracer,
@@ -479,6 +504,7 @@ async def node_search(
     if config is None:
         return [], []
     search_tracer = _resolve_tracer(search_tracer)
+    candidate_limit = SEARCH_CANDIDATE_MULTIPLIER * limit
 
     with _trace_phase(
         search_tracer,
@@ -495,7 +521,7 @@ async def node_search(
         search_tasks = []
         if NodeSearchMethod.bm25 in config.search_methods:
             search_tasks.append(
-                node_fulltext_search(driver, query, search_filter, group_ids, 2 * limit)
+                node_fulltext_search(driver, query, search_filter, group_ids, candidate_limit)
             )
         if NodeSearchMethod.cosine_similarity in config.search_methods:
             search_tasks.append(
@@ -504,7 +530,7 @@ async def node_search(
                     query_vector,
                     search_filter,
                     group_ids,
-                    2 * limit,
+                    candidate_limit,
                     config.sim_min_score,
                 )
             )
@@ -516,7 +542,7 @@ async def node_search(
                     search_filter,
                     config.bfs_max_depth,
                     group_ids,
-                    2 * limit,
+                    candidate_limit,
                     config.bfs_undirected,
                 )
             )
@@ -529,7 +555,7 @@ async def node_search(
                 'search.node_search.execute_methods',
                 {
                     'method_count': len(search_tasks),
-                    'candidate_limit': 2 * limit,
+                    'candidate_limit': candidate_limit,
                 },
             ) as method_span:
                 search_results = list(await semaphore_gather(*search_tasks))
@@ -547,7 +573,7 @@ async def node_search(
                 'search.node_search.expand_bfs',
                 {
                     'origin_node_count': len(origin_node_uuids),
-                    'candidate_limit': 2 * limit,
+                    'candidate_limit': candidate_limit,
                 },
             ):
                 search_results.append(
@@ -557,7 +583,7 @@ async def node_search(
                         search_filter,
                         config.bfs_max_depth,
                         group_ids,
-                        2 * limit,
+                        candidate_limit,
                         config.bfs_undirected,
                     )
                 )
